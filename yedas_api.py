@@ -1,16 +1,8 @@
 """
 yedas_api.py
 ------------
-YEDAS canli planli kesinti API'sini ceker ve st.cache_data(ttl=300) ile
-5 dakikada bir arka planda gunceller.
-
-ONEMLI NOT: YEDAS bu endpoint icin resmi/genel bir API dokumantasyonu
-yayinlamamaktadir. Bu yuzden donen JSON'un olasi birkac farkli sema
-varyasyonunu (liste, {"data": [...]}atasi, GeoJSON {"features": [...]}
-seklinde vb.) deneyerek normallestiren esnek bir parser yazilmistir.
-Gercek canli yanit farkli alan isimleri iceriyorsa, sadece asagidaki
-`_normalize_record` fonksiyonundaki `g(...)` cagrilarina gercek alan
-adini eklemeniz yeterlidir - uygulamanin geri kalani degismez.
+YEDAS canli planli kesinti API'sini ceker.
+Geçici olarak hata ayıklama (debug) modundadır.
 """
 
 import requests
@@ -25,16 +17,29 @@ HEADERS = {
 }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+# Hata ayıklama süresince Streamlit'in eski hatalı veriyi hafızada tutmaması için
+# st.cache_data satırını geçici olarak devre dışı bıraktık.
+# @st.cache_data(ttl=300, show_spinner=False)
 def fetch_yedas_outages():
-    """Donus: (normalized_records: list[dict], error: str|None)
-    Her kayit: {il, ilce, mahalle, baslangic, bitis, aciklama, adres_metni, raw}"""
+    """Donus: (normalized_records: list[dict], error: str|None)"""
     try:
         resp = requests.get(YEDAS_API_URL, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
+        
+        # --- HATA AYIKLAMA (DEBUG) BLOĞU ---
+        if resp.status_code != 200:
+            hata_mesaji = f"🚨 SUNUCU HATASI: {resp.status_code}\n📄 Dönen Cevap Özeti: {resp.text[:400]}"
+            return [], hata_mesaji
+        
         data = resp.json()
+        
+    except requests.exceptions.RequestException as e:
+        return [], f"🌐 İSTEK HATASI: {e}"
+    except ValueError as e: 
+        # İstek 200 döner ama JSON yerine HTML (Captcha/Cloudflare) dönerse yakalayacak
+        hata_mesaji = f"🧩 JSON DÖNÜŞTÜRME HATASI (Muhtemel Bot Koruması): {e}\n📄 Dönen Metin: {resp.text[:400]}"
+        return [], hata_mesaji
     except Exception as e:
-        return [], f"Baglanti/istek hatasi: {e}"
+        return [], f"⚠️ BEKLENMEYEN HATA: {e}"
 
     try:
         raw_records = _extract_records(data)
