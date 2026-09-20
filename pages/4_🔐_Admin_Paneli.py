@@ -1,8 +1,8 @@
 """Ekran 5: Admin Paneli & Yetkilendirme."""
 
-import time
 import pandas as pd
 import streamlit as st
+import concurrent.futures # Hızlı (Paralel) adres bulma için eklendi
 
 from database import (
     init_db, get_all_sites_df, bulk_insert_new_sites, diff_sites_for_sync,
@@ -22,11 +22,10 @@ if not require_admin_login():
     st.stop()
 
 st.divider()
-st.subheader("📥 Saha Excel Yükleme (Reverse Geocoding ile)")
+st.subheader("📥 Saha Excel Yükleme (Otomatik Adres Bulma)")
 st.caption(
     "Excel sütunları: KML Dosyası, Placemark Adı, Açıklama, Latitude, Longitude, "
-    "Altitude, Koordinat (Ham). Adres bilgisi bu ekranda otomatik olarak "
-    "koordinatlardan çıkarılır (Nominatim Reverse Geocoding)."
+    "Altitude, Koordinat (Ham). İl, ilçe, mahalle ArcGIS kullanılarak HIZLI şekilde bulunacaktır."
 )
 
 uploaded = st.file_uploader("Saha Excel Dosyası (.xlsx)", type=["xlsx"])
@@ -43,7 +42,6 @@ if uploaded is not None:
         st.error(f"Excel'de şu sütunlar bulunmalı: {sorted(required_cols)}")
         st.stop()
 
-    # Boş koordinatları filtrele (Hata almamak için)
     new_df = new_df.dropna(subset=["Latitude", "Longitude"])
 
     st.write(f"Excel'de {len(new_df)} satır okundu.")
@@ -54,23 +52,31 @@ if uploaded is not None:
     st.write(f"🔴 Silinecek saha sayısı: **{len(removed)}**")
     st.write(f"⚪ Değişmeyen saha sayısı: **{len(unchanged)}**")
 
-    # Raporu hafızada tutmak için session_state kontrolü
     if "fark_raporu_jpg" not in st.session_state:
         st.session_state.fark_raporu_jpg = None
 
     if st.button("✅ Senkronizasyonu Onayla ve Başlat"):
-        progress = st.progress(0.0, text="Reverse geocoding başlatılıyor...")
+        progress = st.progress(0.0, text="Eşzamanlı (Hızlı) Adres Bulma başlatılıyor...")
 
         geocoded_rows = []
         total = len(added) or 1
-        for i, row in enumerate(added):
+        
+        # Paralel adres bulma fonksiyonu (Worker)
+        def fetch_address_for_row(row):
             il, ilce, mahalle = reverse_geocode(row.get("Latitude"), row.get("Longitude"))
-            geocoded_rows.append({**row, "il": il, "ilce": ilce, "mahalle": mahalle})
-            progress.progress(min((i + 1) / total, 1.0), text=f"Reverse geocoding: %{int((i + 1) / total * 100)}")
+            return {**row, "il": il, "ilce": ilce, "mahalle": mahalle}
+
+        # Aynı anda 10 istek atarak işlemi yaklaşık 10 kat hızlandırıyoruz
+        completed = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # Tüm satırları iş kuyruğuna ekle
+            futures = {executor.submit(fetch_address_for_row, row): row for row in added}
             
-            # Nominatim API Rate Limit (1 saniyede 1 istek) kuralı için bekleme süresi
-            if i < total - 1:
-                time.sleep(1.1)
+            # İşler bittikçe sonuçları topla
+            for future in concurrent.futures.as_completed(futures):
+                geocoded_rows.append(future.result())
+                completed += 1
+                progress.progress(min(completed / total, 1.0), text=f"Adresler bulunuyor: {completed} / {total}")
 
         if geocoded_rows:
             bulk_insert_new_sites(geocoded_rows)
@@ -85,10 +91,8 @@ if uploaded is not None:
         progress.progress(1.0, text="Tamamlandı")
         st.success(f"Senkronizasyon tamamlandı: {len(added_names)} saha eklendi, {len(removed_names)} saha silindi.")
 
-        # Raporu oluştur ve session_state'e kaydet
         st.session_state.fark_raporu_jpg = generate_diff_report_jpg(added_names, removed_names)
 
-    # İndirme butonunu button bloğunun dışına alıyoruz (Sayfa yenilendiğinde kaybolmaması için)
     if st.session_state.fark_raporu_jpg is not None:
         st.download_button(
             "🖼️ Fark Raporu Çıkart (JPG)", 
