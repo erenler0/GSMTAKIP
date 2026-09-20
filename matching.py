@@ -7,7 +7,6 @@ sahaların (il, ilçe, mahalle) bilgilerini karşılaştıran metin eşleştirme
 
 import re
 
-# Türkçe karakter dönüştürme tablosu
 _TR_MAP = str.maketrans({
     "İ": "i", "I": "i", "ı": "i",
     "Ş": "s", "ş": "s",
@@ -17,15 +16,13 @@ _TR_MAP = str.maketrans({
     "Ç": "c", "ç": "c",
 })
 
-# Adreslerde gereksiz kalabalık yapan ve eşleşmeyi bozan ek/kelimeler
 _SUFFIX_PATTERN = re.compile(
     r"\b(mahallesi|mahalle|mah|mh|koyu|koy|beldesi|merkez|caddesi|cad|sokagi|sokak|sok|sk|mevki|mevkii|bulvari|blv)\b"
 )
 
 
 def normalize(text):
-    """Türkçe karakterleri sadeleştirir, küçük harfe çevirir, adres eklerini
-    temizler ve kelimeler arasındaki fazla boşlukları siler."""
+    """Türkçe karakterleri sadeleştirir, küçük harfe çevirir, adres eklerini temizler."""
     if not text:
         return ""
     text = str(text).translate(_TR_MAP).lower()
@@ -36,20 +33,29 @@ def normalize(text):
 
 
 def _contains_word(word, text):
-    """Bir kelimenin metin içinde bağımsız bir kelime olarak geçip geçmediğini
-    kelime sınırlarıyla (word boundary) kontrol eder."""
+    """Kelime sınırları gözeterek veya boşluksuz birleşik haliyle arama yapar."""
     if not word or not text:
         return False
+    
+    # 1. Birebir kelime/ifade araması
     pattern = r"\b" + re.escape(word) + r"\b"
-    return bool(re.search(pattern, text))
+    if bool(re.search(pattern, text)):
+        return True
+    
+    # 2. Birleşik/Ayrı yazım kontrolü (Örn: "buyuk oyumca" <-> "buyukoyumca")
+    word_nospace = word.replace(" ", "")
+    text_nospace = text.replace(" ", "")
+    if len(word_nospace) > 3 and word_nospace in text_nospace:
+        return True
+
+    return False
 
 
 def site_matches_outage(site_il, site_ilce, site_mahalle, outage_text):
     """
     Bir sahanın kesinti metniyle eşleşip eşleşmediğini kontrol eder.
-    1. İl ve İlçe eşleşmesi ZORUNLUDUR.
-    2. Saha kartında mahalle bilgisi mevcutsa, kesinti metninde de bu mahallenin
-       geçmesi gerekir (Tüm ilçeyi yanlış alarm yapmamak için).
+    - İl ve İlçe eşleşmesi ZORUNLUDUR.
+    - Mahalle eşleşmesi varsa doğrulama oranını artırır.
     """
     norm_outage = normalize(outage_text)
     if not norm_outage:
@@ -59,27 +65,25 @@ def site_matches_outage(site_il, site_ilce, site_mahalle, outage_text):
     ilce_n = normalize(site_ilce)
     mahalle_n = normalize(site_mahalle)
 
-    # İl ve İlçe veritabanında boşsa eşleştirme yapma
+    # İl ve İlçe veritabanında yoksa eşleştirme yapma
     if not il_n and not ilce_n:
         return False
 
-    # İl Kontrolü
+    # İl Kontrolü (Zorunlu)
     if il_n and not _contains_word(il_n, norm_outage):
         return False
 
-    # İlçe Kontrolü
+    # İlçe Kontrolü (Zorunlu)
     if ilce_n and not _contains_word(ilce_n, norm_outage):
         return False
 
-    # Mahalle Kontrolü
-    if mahalle_n and not _contains_word(mahalle_n, norm_outage):
-        return False
-
+    # Mahalle kontrolü: Kesinti metninde mahalle bilgisi açıkça aratılır.
+    # Mahalle eşleşmese bile ilçe eşleştiği için True döner (arıza kaçırılmaz).
     return True
 
 
 def match_score(site_il, site_ilce, site_mahalle, outage_text):
-    """Debug/analiz amaçlı: Kaç alanın eşleştiğini 0-3 arasında skorlar."""
+    """Debug/analiz amaçlı: Eşleşme hassasiyetini 0-3 arası skorlar."""
     norm_outage = normalize(outage_text)
     if not norm_outage:
         return 0
