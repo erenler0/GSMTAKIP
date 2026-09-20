@@ -1,8 +1,8 @@
 """
 yedas_api.py
 ------------
-YEDAŞ canlı planlı kesinti API'sini çeker ve gerçek JSON şemasına göre ayrıştırır.
-Şema: result -> data -> [ {address: [...], title: "...", details: "...", ...} ]
+YEDAŞ API yanıtındaki ID tabanlı adres verilerini (id_city, id_district vb.)
+ve metinsel detayları ayrıştırarak eşleştirme motoruna hazır hale getirir.
 """
 
 import re
@@ -17,6 +17,15 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
+# YEDAŞ Sorumluluk Bölgesi İl Kodları
+CITY_MAP = {
+    "55": "SAMSUN",
+    "52": "ORDU",
+    "28": "GİRESUN",
+    "57": "SİNOP",
+    "60": "TOKAT"
+}
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_yedas_outages():
@@ -26,10 +35,9 @@ def fetch_yedas_outages():
         resp.raise_for_status()
         raw_json = resp.json()
     except Exception as e:
-        return [], f"Bağlantı/İstek Hatası: {e}"
+        return [], f"Bağlantı Hatası: {e}"
 
     try:
-        # YEDAŞ Gerçek JSON Yapısı: result -> data
         result_obj = raw_json.get("result", {})
         if isinstance(result_obj, dict):
             items = result_obj.get("data", [])
@@ -45,14 +53,10 @@ def fetch_yedas_outages():
 
 
 def _normalize_record(r):
-    # 1. Başlık / Çalışma Nedeni
     aciklama = r.get("title", "Planlı Kesinti")
-
-    # 2. Tarih ve Zaman Bilgisi (details metni içerisinden çekilir)
     details_text = r.get("details", "")
     baslangic, bitis = _parse_dates_from_details(details_text)
 
-    # 3. Adres Metni & İl / İlçe / Mahalle Çıkarımı
     address_list = r.get("address", [])
     adres_parcalari = []
     il, ilce, mahalle = None, None, None
@@ -60,24 +64,28 @@ def _normalize_record(r):
     if isinstance(address_list, list):
         for addr in address_list:
             if isinstance(addr, dict):
-                # Olası alan isimleri
-                il = il or addr.get("city_name") or addr.get("city") or addr.get("il")
-                ilce = ilce or addr.get("district_name") or addr.get("district") or addr.get("ilce")
-                mahalle = mahalle or addr.get("mahalle_name") or addr.get("mahalle") or addr.get("name")
-                
-                # Obje içerisindeki metinsel değerleri adres metnine ekle
-                for key, val in addr.items():
-                    if isinstance(val, str) and not val.isdigit() and len(val) > 1:
-                        adres_parcalari.append(val)
-            elif isinstance(addr, str):
-                adres_parcalari.append(addr)
-    elif isinstance(address_list, str):
-        adres_parcalari.append(address_list)
+                # İl ID'sinden İl İsmini Yakala (Örn: 55 -> SAMSUN)
+                city_id = str(addr.get("id_city", ""))
+                if city_id in CITY_MAP:
+                    il = CITY_MAP[city_id]
+                    adres_parcalari.append(il)
 
-    # Adres metnini birleştir
-    adres_metni = " ".join(adres_parcalari).strip()
-    if not adres_metni:
-        adres_metni = f"{il or ''} {ilce or ''} {mahalle or ''} {aciklama}".strip()
+                # Metinsel il/ilçe/mahalle/sokak alanları varsa ekle
+                for key in ("district_name", "ilce", "district", "mahalle_name", "mahalle", "street_name", "name", "text"):
+                    val = addr.get(key)
+                    if val and isinstance(val, str) and not val.isdigit():
+                        adres_parcalari.append(val)
+                        if not ilce and "district" in key:
+                            ilce = val
+                        if not mahalle and "mahalle" in key:
+                            mahalle = val
+
+    # Eğer ilçe adı ID olarak geldiyse veya adresten okunamadıysa varsayılan metinden ayıkla
+    adres_metni = " ".join(dict.fromkeys(adres_parcalari)).strip()
+    
+    # Adres metni boş kaldıysa başlık ve detay bilgisini ekle
+    if not adres_metni or len(adres_metni) < 5:
+        adres_metni = f"{il or ''} {ilce or ''} {mahalle or ''} {aciklama} {details_text}".strip()
 
     return {
         "il": il,
@@ -92,13 +100,9 @@ def _normalize_record(r):
 
 
 def _parse_dates_from_details(text):
-    """details string'i içerisindeki Başlangıç ve Bitiş zamanlarını yakalar."""
     if not text:
         return None, None
-    
-    # Regex ile tarih formatlarını yakala (Örn: 30.09.2026 09:00:00)
     dates = re.findall(r"\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2}", str(text))
     baslangic = dates[0] if len(dates) >= 1 else None
     bitis = dates[1] if len(dates) >= 2 else None
-    
     return baslangic, bitis
