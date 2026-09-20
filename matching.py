@@ -1,16 +1,13 @@
 """
 matching.py
 -----------
-YEDAS API'sinden gelen serbest metin adres bilgisi ile veritabanindaki
-sahalarin (reverse-geocoding ile bulunmus) il/ilce/mahalle bilgilerini
-karsilastiran text-matching mantigi.
-
-Poligon/harita alani bazli eslestirme KULLANILMAZ - talimat geregi sadece
-string/metin karsilastirmasi yapilir.
+YEDAŞ API'sinden gelen serbest metin adres bilgisi ile veritabanındaki
+sahaların (il, ilçe, mahalle) bilgilerini karşılaştıran metin eşleştirme mantığı.
 """
 
 import re
 
+# Türkçe karakter dönüştürme tablosu
 _TR_MAP = str.maketrans({
     "İ": "i", "I": "i", "ı": "i",
     "Ş": "s", "ş": "s",
@@ -20,13 +17,16 @@ _TR_MAP = str.maketrans({
     "Ç": "c", "ç": "c",
 })
 
-_SUFFIX_PATTERN = re.compile(r"\b(mahallesi|mahallesi|mahalle|mah|koyu|koy|beldesi|merkez)\b")
+# Adreslerde gereksiz kalabalık yapan ve eşleşmeyi bozan ek/kelimeler
+_SUFFIX_PATTERN = re.compile(
+    r"\b(mahallesi|mahalle|mah|mh|koyu|koy|beldesi|merkez|caddesi|cad|sokagi|sokak|sok|sk|mevki|mevkii|bulvari|blv)\b"
+)
 
 
 def normalize(text):
-    """Turkce karakterleri sadelestirir, kucuk harfe cevirir, gereksiz
-    ekleri (mahallesi, koyu, vb.) temizler, tekrarli bosluklari siler."""
-    if text is None:
+    """Türkçe karakterleri sadeleştirir, küçük harfe çevirir, adres eklerini
+    temizler ve kelimeler arasındaki fazla boşlukları siler."""
+    if not text:
         return ""
     text = str(text).translate(_TR_MAP).lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
@@ -35,35 +35,58 @@ def normalize(text):
     return text
 
 
+def _contains_word(word, text):
+    """Bir kelimenin metin içinde bağımsız bir kelime olarak geçip geçmediğini
+    kelime sınırlarıyla (word boundary) kontrol eder."""
+    if not word or not text:
+        return False
+    pattern = r"\b" + re.escape(word) + r"\b"
+    return bool(re.search(pattern, text))
+
+
 def site_matches_outage(site_il, site_ilce, site_mahalle, outage_text):
-    """Bir sahanin, verilen YEDAS kesinti metniyle eslesip eslesmedigini doner.
-    Il ve ilce eslesmesi zorunludur (ikisi de bos degilse); mahalle bulunuyorsa
-    ekstra dogrulama olarak kullanilir fakat zorunlu tutulmaz (Nominatim mahalle
-    isimlendirmesi YEDAS'in kullandigi isimlendirmeyle her zaman birebir
-    ortusmeyebilir)."""
+    """
+    Bir sahanın kesinti metniyle eşleşip eşleşmediğini kontrol eder.
+    1. İl ve İlçe eşleşmesi ZORUNLUDUR.
+    2. Saha kartında mahalle bilgisi mevcutsa, kesinti metninde de bu mahallenin
+       geçmesi gerekir (Tüm ilçeyi yanlış alarm yapmamak için).
+    """
     norm_outage = normalize(outage_text)
     if not norm_outage:
         return False
 
     il_n = normalize(site_il)
     ilce_n = normalize(site_ilce)
+    mahalle_n = normalize(site_mahalle)
 
-    if il_n and il_n not in norm_outage:
-        return False
-    if ilce_n and ilce_n not in norm_outage:
-        return False
-    # Il ve ilce her ikisi de bossa (geocoding basarisiz olduysa) eslestirme yapma
+    # İl ve İlçe veritabanında boşsa eşleştirme yapma
     if not il_n and not ilce_n:
         return False
+
+    # İl Kontrolü
+    if il_n and not _contains_word(il_n, norm_outage):
+        return False
+
+    # İlçe Kontrolü
+    if ilce_n and not _contains_word(ilce_n, norm_outage):
+        return False
+
+    # Mahalle Kontrolü
+    if mahalle_n and not _contains_word(mahalle_n, norm_outage):
+        return False
+
     return True
 
 
 def match_score(site_il, site_ilce, site_mahalle, outage_text):
-    """Debug/analiz amacli: kac alanin eslesigini 0-3 arasinda skorlar."""
+    """Debug/analiz amaçlı: Kaç alanın eşleştiğini 0-3 arasında skorlar."""
     norm_outage = normalize(outage_text)
+    if not norm_outage:
+        return 0
+
     score = 0
     for value in (site_il, site_ilce, site_mahalle):
         v = normalize(value)
-        if v and v in norm_outage:
+        if v and _contains_word(v, norm_outage):
             score += 1
     return score
