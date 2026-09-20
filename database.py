@@ -16,8 +16,8 @@ Bu detay README.md icinde de belirtilmistir.
 import os
 import sqlite3
 from contextlib import contextmanager
-
 import pandas as pd
+import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "database.db")
@@ -49,7 +49,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sites (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kml_dosyasi TEXT,
-                placemark_adi TEXT NOT NULL,
+                placemark_adi TEXT NOT NULL UNIQUE, 
                 aciklama TEXT,
                 latitude REAL NOT NULL,
                 longitude REAL NOT NULL,
@@ -65,6 +65,12 @@ def init_db():
                 FOREIGN KEY (assigned_center_id) REFERENCES district_centers(id) ON DELETE SET NULL
             )
         """)
+        # Eski tablolarda placemark_adi UNIQUE olmayabileceği için tabloyu güvene alıyoruz.
+        try:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_placemark_adi ON sites(placemark_adi)")
+        except sqlite3.OperationalError:
+            pass
+            
         cur.execute("""
             CREATE TABLE IF NOT EXISTS district_centers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,22 +149,28 @@ def get_all_sites_df():
 
 
 def bulk_insert_new_sites(rows):
-    """rows: dict listesi. Excel sutun adlari + il/ilce/mahalle (geocoding sonucu) icerir."""
+    """rows: dict listesi. Hata veren bos (NaN) degerler temizlendi, INSERT OR REPLACE eklendi."""
     if not rows:
         return
     with db_cursor(commit=True) as cur:
         for r in rows:
+            lat = r.get("Latitude")
+            lon = r.get("Longitude")
+            
+            # Pandas'tan gelen NaN veya bos verileri yakala (NOT NULL hatasini onler)
+            if pd.isna(lat) or pd.isna(lon) or lat == "" or lon == "":
+                continue
+
             cur.execute("""
-                INSERT INTO sites
+                INSERT OR REPLACE INTO sites
                     (kml_dosyasi, placemark_adi, aciklama, latitude, longitude,
                      altitude, koordinat_ham, il, ilce, mahalle)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 r.get("KML Dosyası"), r.get("Placemark Adı"), r.get("Açıklama"),
-                r.get("Latitude"), r.get("Longitude"), r.get("Altitude"),
-                r.get("Koordinat (Ham)"), r.get("il"), r.get("ilce"), r.get("mahalle"),
+                float(lat), float(lon), r.get("Altitude"),
+                r.get("Koordinat (Ham)"), r.get("il", "Bekliyor"), r.get("ilce", "Bekliyor"), r.get("mahalle", "Bekliyor"),
             ))
-
 
 def delete_sites_by_names(names):
     if not names:
@@ -168,9 +180,6 @@ def delete_sites_by_names(names):
 
 
 def diff_sites_for_sync(existing_df, new_df):
-    """Placemark Adi'na gore yeni eklenecek / silinecek / degismeyen sahalari bulur.
-    existing_df bossa (ilk yukleme), tum satirlar 'added' olarak doner -> tek seferlik
-    reverse geocoding mantigi buradan otomatik saglanir."""
     existing_names = set(existing_df["placemark_adi"]) if not existing_df.empty else set()
     new_names = set(new_df["Placemark Adı"])
 
@@ -191,6 +200,29 @@ def log_sync(added_names, removed_names):
             (",".join(added_names), ",".join(removed_names), len(added_names), len(removed_names)),
         )
 
+# --- YENİ EKLENEN REVERSE GEOCODING YARDIMCI FONKSİYONLARI ---
+
+def get_sites_without_address():
+    """Adresi eksik veya 'Bekliyor' olan sahalari getirir."""
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            "SELECT id, placemark_adi, latitude, longitude FROM sites WHERE il IS NULL OR il = 'Bekliyor'", 
+            conn
+        )
+    finally:
+        conn.close()
+    return df
+
+def update_site_address(site_id, il, ilce, mahalle):
+    """Admin panelindeki batch (parcali) adres cozme islemi sirasinda tekil sahayi gunceller."""
+    with db_cursor(commit=True) as cur:
+        cur.execute("""
+            UPDATE sites 
+            SET il = ?, ilce = ?, mahalle = ?, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = ?
+        """, (il, ilce, mahalle, site_id))
+
 
 # ------------------------------------------------------- DISTRICT CENTERS --
 
@@ -202,7 +234,6 @@ def get_all_centers_df():
         conn.close()
     return df
 
-
 def add_center(isim, il, ilce, lat, lon):
     with db_cursor(commit=True) as cur:
         cur.execute(
@@ -210,11 +241,9 @@ def add_center(isim, il, ilce, lat, lon):
             (isim, il, ilce, lat, lon),
         )
 
-
 def delete_center(center_id):
     with db_cursor(commit=True) as cur:
         cur.execute("DELETE FROM district_centers WHERE id = ?", (center_id,))
-
 
 def assign_center_to_site(site_id, center_id, manual=False):
     with db_cursor(commit=True) as cur:
@@ -279,8 +308,6 @@ def delete_outage(outage_id):
 # ----------------------------------------------------- YEDAS OUTAGE HISTORY
 
 def save_outage_history(records):
-    """records: dict listesi -> site_id, site_name, il, ilce, mahalle,
-    start_time, end_time, description. Ayni kayit tekrar eklenmez (UNIQUE)."""
     if not records:
         return
     with db_cursor(commit=True) as cur:
