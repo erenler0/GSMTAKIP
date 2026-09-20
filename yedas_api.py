@@ -1,10 +1,11 @@
 """
 yedas_api.py
 ------------
-YEDAS canli planli kesinti API'sini ceker.
-Geçici olarak hata ayıklama (debug) modundadır.
+YEDAŞ canlı planlı kesinti API'sini çeker ve gerçek JSON şemasına göre ayrıştırır.
+Şema: result -> data -> [ {address: [...], title: "...", details: "...", ...} ]
 """
 
+import re
 import requests
 import streamlit as st
 
@@ -17,71 +18,66 @@ HEADERS = {
 }
 
 
-# Hata ayıklama süresince Streamlit'in eski hatalı veriyi hafızada tutmaması için
-# st.cache_data satırını geçici olarak devre dışı bıraktık.
-# @st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_yedas_outages():
-    """Donus: (normalized_records: list[dict], error: str|None)"""
+    """Dönüş: (normalized_records: list[dict], error: str|None)"""
     try:
         resp = requests.get(YEDAS_API_URL, headers=HEADERS, timeout=20)
-        
-        # --- HATA AYIKLAMA (DEBUG) BLOĞU ---
-        if resp.status_code != 200:
-            hata_mesaji = f"🚨 SUNUCU HATASI: {resp.status_code}\n📄 Dönen Cevap Özeti: {resp.text[:400]}"
-            return [], hata_mesaji
-        
-        data = resp.json()
-        
-    except requests.exceptions.RequestException as e:
-        return [], f"🌐 İSTEK HATASI: {e}"
-    except ValueError as e: 
-        # İstek 200 döner ama JSON yerine HTML (Captcha/Cloudflare) dönerse yakalayacak
-        hata_mesaji = f"🧩 JSON DÖNÜŞTÜRME HATASI (Muhtemel Bot Koruması): {e}\n📄 Dönen Metin: {resp.text[:400]}"
-        return [], hata_mesaji
+        resp.raise_for_status()
+        raw_json = resp.json()
     except Exception as e:
-        return [], f"⚠️ BEKLENMEYEN HATA: {e}"
+        return [], f"Bağlantı/İstek Hatası: {e}"
 
     try:
-        raw_records = _extract_records(data)
-        normalized = [_normalize_record(r) for r in raw_records]
+        # YEDAŞ Gerçek JSON Yapısı: result -> data
+        result_obj = raw_json.get("result", {})
+        if isinstance(result_obj, dict):
+            items = result_obj.get("data", [])
+        elif isinstance(result_obj, list):
+            items = result_obj
+        else:
+            items = raw_json.get("data", [])
+
+        normalized = [_normalize_record(item) for item in items if isinstance(item, dict)]
         return normalized, None
     except Exception as e:
-        return [], f"Veri ayristirma hatasi: {e}"
-
-
-def _extract_records(data):
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("data", "result", "results", "kesintiler", "items", "features", "records"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-    return []
+        return [], f"Veri Ayrıştırma Hatası: {e}"
 
 
 def _normalize_record(r):
-    # GeoJSON tarzi kayitlarda gercek alanlar "properties" altinda olabilir
-    props = r.get("properties", r) if isinstance(r, dict) else {}
+    # 1. Başlık / Çalışma Nedeni
+    aciklama = r.get("title", "Planlı Kesinti")
 
-    def g(*keys):
-        for k in keys:
-            v = props.get(k)
-            if v:
-                return v
-        return None
+    # 2. Tarih ve Zaman Bilgisi (details metni içerisinden çekilir)
+    details_text = r.get("details", "")
+    baslangic, bitis = _parse_dates_from_details(details_text)
 
-    il = g("il", "İl", "province", "IL", "sehir")
-    ilce = g("ilce", "İlçe", "district", "ILCE", "ilceAdi")
-    mahalle = g("mahalle", "Mahalle", "mevki", "Mevki", "neighbourhood", "mahalleAdi")
-    baslangic = g("baslangic", "baslangicTarihi", "start", "startDate", "kesintiBaslangic", "baslangicSaati")
-    bitis = g("bitis", "bitisTarihi", "end", "endDate", "kesintiBitis", "bitisSaati")
-    aciklama = g("aciklama", "isAciklamasi", "description", "not", "sebep", "aciklamaMetni")
+    # 3. Adres Metni & İl / İlçe / Mahalle Çıkarımı
+    address_list = r.get("address", [])
+    adres_parcalari = []
+    il, ilce, mahalle = None, None, None
 
-    adres_parcalari = [str(x) for x in (il, ilce, mahalle) if x]
-    adres_metni = " ".join(adres_parcalari)
-    if aciklama:
-        adres_metni = f"{adres_metni} {aciklama}".strip()
+    if isinstance(address_list, list):
+        for addr in address_list:
+            if isinstance(addr, dict):
+                # Olası alan isimleri
+                il = il or addr.get("city_name") or addr.get("city") or addr.get("il")
+                ilce = ilce or addr.get("district_name") or addr.get("district") or addr.get("ilce")
+                mahalle = mahalle or addr.get("mahalle_name") or addr.get("mahalle") or addr.get("name")
+                
+                # Obje içerisindeki metinsel değerleri adres metnine ekle
+                for key, val in addr.items():
+                    if isinstance(val, str) and not val.isdigit() and len(val) > 1:
+                        adres_parcalari.append(val)
+            elif isinstance(addr, str):
+                adres_parcalari.append(addr)
+    elif isinstance(address_list, str):
+        adres_parcalari.append(address_list)
+
+    # Adres metnini birleştir
+    adres_metni = " ".join(adres_parcalari).strip()
+    if not adres_metni:
+        adres_metni = f"{il or ''} {ilce or ''} {mahalle or ''} {aciklama}".strip()
 
     return {
         "il": il,
@@ -90,6 +86,19 @@ def _normalize_record(r):
         "baslangic": baslangic,
         "bitis": bitis,
         "aciklama": aciklama,
-        "adres_metni": adres_metni.strip(),
+        "adres_metni": adres_metni,
         "raw": r,
     }
+
+
+def _parse_dates_from_details(text):
+    """details string'i içerisindeki Başlangıç ve Bitiş zamanlarını yakalar."""
+    if not text:
+        return None, None
+    
+    # Regex ile tarih formatlarını yakala (Örn: 30.09.2026 09:00:00)
+    dates = re.findall(r"\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2}", str(text))
+    baslangic = dates[0] if len(dates) >= 1 else None
+    bitis = dates[1] if len(dates) >= 2 else None
+    
+    return baslangic, bitis
