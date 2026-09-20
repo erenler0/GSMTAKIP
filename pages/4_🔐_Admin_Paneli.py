@@ -1,5 +1,6 @@
 """Ekran 5: Admin Paneli & Yetkilendirme."""
 
+import time
 import pandas as pd
 import streamlit as st
 
@@ -42,6 +43,9 @@ if uploaded is not None:
         st.error(f"Excel'de şu sütunlar bulunmalı: {sorted(required_cols)}")
         st.stop()
 
+    # Boş koordinatları filtrele (Hata almamak için)
+    new_df = new_df.dropna(subset=["Latitude", "Longitude"])
+
     st.write(f"Excel'de {len(new_df)} satır okundu.")
     existing_df = get_all_sites_df()
     added, removed, unchanged = diff_sites_for_sync(existing_df, new_df)
@@ -49,6 +53,10 @@ if uploaded is not None:
     st.write(f"🟢 Yeni eklenecek saha sayısı: **{len(added)}**")
     st.write(f"🔴 Silinecek saha sayısı: **{len(removed)}**")
     st.write(f"⚪ Değişmeyen saha sayısı: **{len(unchanged)}**")
+
+    # Raporu hafızada tutmak için session_state kontrolü
+    if "fark_raporu_jpg" not in st.session_state:
+        st.session_state.fark_raporu_jpg = None
 
     if st.button("✅ Senkronizasyonu Onayla ve Başlat"):
         progress = st.progress(0.0, text="Reverse geocoding başlatılıyor...")
@@ -59,6 +67,10 @@ if uploaded is not None:
             il, ilce, mahalle = reverse_geocode(row.get("Latitude"), row.get("Longitude"))
             geocoded_rows.append({**row, "il": il, "ilce": ilce, "mahalle": mahalle})
             progress.progress(min((i + 1) / total, 1.0), text=f"Reverse geocoding: %{int((i + 1) / total * 100)}")
+            
+            # Nominatim API Rate Limit (1 saniyede 1 istek) kuralı için bekleme süresi
+            if i < total - 1:
+                time.sleep(1.1)
 
         if geocoded_rows:
             bulk_insert_new_sites(geocoded_rows)
@@ -73,10 +85,16 @@ if uploaded is not None:
         progress.progress(1.0, text="Tamamlandı")
         st.success(f"Senkronizasyon tamamlandı: {len(added_names)} saha eklendi, {len(removed_names)} saha silindi.")
 
-        jpg_buf = generate_diff_report_jpg(added_names, removed_names)
+        # Raporu oluştur ve session_state'e kaydet
+        st.session_state.fark_raporu_jpg = generate_diff_report_jpg(added_names, removed_names)
+
+    # İndirme butonunu button bloğunun dışına alıyoruz (Sayfa yenilendiğinde kaybolmaması için)
+    if st.session_state.fark_raporu_jpg is not None:
         st.download_button(
-            "🖼️ Fark Raporu Çıkart (JPG)", data=jpg_buf,
-            file_name="fark_raporu.jpg", mime="image/jpeg",
+            "🖼️ Fark Raporu Çıkart (JPG)", 
+            data=st.session_state.fark_raporu_jpg,
+            file_name="fark_raporu.jpg", 
+            mime="image/jpeg",
         )
 
 st.divider()
